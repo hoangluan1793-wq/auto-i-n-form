@@ -33,10 +33,16 @@ def _data_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+VN_TZ = datetime.timezone(datetime.timedelta(hours=7))
 DB_PATH = os.path.join(_data_dir(), "forms_db.json")
 DB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()
-RUN_STATE = {"running": False, "stop": False, "done": 0, "total": 0, "ok": 0, "err": 0, "logs": []}
+RUN_STATE = {"running": False, "stop": False, "run_id": 0, "done": 0, "total": 0, "ok": 0, "err": 0, "logs": []}
+STOP_EVENT = threading.Event()
+
+
+def _now_vn() -> datetime.datetime:
+    return datetime.datetime.now(VN_TZ)
 
 
 def _load_db() -> list[dict]:
@@ -57,7 +63,7 @@ def _save_db(forms: list[dict]) -> None:
 
 
 def _log(msg: str) -> None:
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    ts = _now_vn().strftime("%H:%M:%S")
     with RUN_LOCK:
         RUN_STATE["logs"].append(f"[{ts}] {msg}")
         if len(RUN_STATE["logs"]) > 300:
@@ -65,7 +71,7 @@ def _log(msg: str) -> None:
 
 
 def _in_schedule(start_s: str, end_s: str) -> bool:
-    now = datetime.datetime.now().strftime("%H:%M")
+    now = _now_vn().strftime("%H:%M")
     if start_s <= end_s:
         return start_s <= now <= end_s
     return now >= start_s or now <= end_s
@@ -78,15 +84,25 @@ def _pick_delay(cfg: dict) -> float:
     if mode == "short":
         return random.uniform(60, 300)
     if mode == "standard":
-        return random.uniform(60, 600)
+        return random.uniform(180, 600)
     if mode == "long":
-        return random.uniform(60, 1200)
+        return random.uniform(600, 1200)
     lo = max(0.0, float(cfg.get("min_sec", 1)))
     hi = max(lo, float(cfg.get("max_sec", lo)))
+    if mode == "custom_min":
+        return random.uniform(lo * 60.0, hi * 60.0)
     return random.uniform(lo, hi)
 
 
-def _runner(cfg: dict) -> None:
+def _fmt_wait(sec: float) -> str:
+    s = int(round(sec))
+    if s < 60:
+        return f"{s} giây"
+    m, rem = divmod(s, 60)
+    return f"{m} phút {rem} giây" if rem else f"{m} phút"
+
+
+def _runner(cfg: dict, run_id: int, stop_ev: threading.Event) -> None:
     form = cfg["form"]
     mode = cfg.get("mode", "ratio")
     count = max(1, int(cfg.get("count", 1)))
@@ -94,6 +110,10 @@ def _runner(cfg: dict) -> None:
     sched_on = bool(cfg.get("sched_enabled", False))
     s_start = cfg.get("sched_start", "08:00")
     s_end = cfg.get("sched_end", "22:00")
+
+    def _active() -> bool:
+        with RUN_LOCK:
+            return not stop_ev.is_set() and RUN_STATE["run_id"] == run_id
 
     pre_rows = []
     if mode == "nckh":
@@ -104,11 +124,13 @@ def _runner(cfg: dict) -> None:
         if not raw_rows:
             _log("LỖI: Chưa tải dữ liệu CSV/Sheet.")
             with RUN_LOCK:
-                RUN_STATE["running"] = False
+                if RUN_STATE["run_id"] == run_id:
+                    RUN_STATE["running"] = False
             return
         count = min(count, len(raw_rows))
         with RUN_LOCK:
-            RUN_STATE["total"] = count
+            if RUN_STATE["run_id"] == run_id:
+                RUN_STATE["total"] = count
         for r in raw_rows[:count]:
             ov = {}
             for eid, col_idx in mapping.items():
@@ -119,21 +141,17 @@ def _runner(cfg: dict) -> None:
     _log(f"Bắt đầu ({mode}, {'CHẠY THỬ' if dry else 'GỬI THẬT'}): {count} phiếu...")
     try:
         for i in range(count):
-            with RUN_LOCK:
-                if RUN_STATE["stop"]:
-                    _log("Đã dừng theo yêu cầu.")
-                    break
+            if not _active():
+                break
 
             while sched_on and not _in_schedule(s_start, s_end):
-                with RUN_LOCK:
-                    if RUN_STATE["stop"]:
-                        break
-                _log(f"Ngoài khung giờ ({s_start}-{s_end}), chờ 30s...")
-                time.sleep(30)
-
-            with RUN_LOCK:
-                if RUN_STATE["stop"]:
+                if not _active():
                     break
+                _log(f"Ngoài khung giờ ({s_start}-{s_end}), chờ 30s...")
+                stop_ev.wait(30)
+
+            if not _active():
+                break
 
             overrides = pre_rows[i] if pre_rows else None
             fields = sample_by_ratios(form["questions"], overrides)
@@ -144,29 +162,34 @@ def _runner(cfg: dict) -> None:
             else:
                 ok, info = submit_response(form["url"], fields, form["pages"])
 
+            if not _active():
+                break
+
             with RUN_LOCK:
-                RUN_STATE["done"] += 1
-                if ok:
-                    RUN_STATE["ok"] += 1
-                else:
-                    RUN_STATE["err"] += 1
+                if RUN_STATE["run_id"] == run_id:
+                    RUN_STATE["done"] += 1
+                    if ok:
+                        RUN_STATE["ok"] += 1
+                    else:
+                        RUN_STATE["err"] += 1
             _log(f"Phiếu {i + 1}/{count}: {'OK' if ok else 'LỖI'} — {info}")
 
             if i < count - 1:
                 wait_s = _pick_delay(cfg)
-                end_t = time.time() + wait_s
-                while time.time() < end_t:
-                    with RUN_LOCK:
-                        if RUN_STATE["stop"]:
-                            break
-                    time.sleep(min(0.5, end_t - time.time()))
+                if wait_s >= 5:
+                    next_at = (_now_vn() + datetime.timedelta(seconds=wait_s)).strftime("%H:%M:%S")
+                    _log(f"Chờ {_fmt_wait(wait_s)} (gửi tiếp lúc {next_at})...")
+                if stop_ev.wait(wait_s):
+                    break
 
-        _log("HOÀN THÀNH.")
+        if _active():
+            _log("HOÀN THÀNH.")
     except Exception as e:
         _log(f"LỖI HỆ THỐNG: {e}")
     finally:
         with RUN_LOCK:
-            RUN_STATE["running"] = False
+            if RUN_STATE["run_id"] == run_id:
+                RUN_STATE["running"] = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -249,14 +272,22 @@ class Handler(BaseHTTPRequestHandler):
                     if RUN_STATE["running"]:
                         self._send_json({"error": "Đang có tiến trình chạy!"}, 400)
                         return
+                    RUN_STATE["run_id"] += 1
+                    rid = RUN_STATE["run_id"]
+                    STOP_EVENT.clear()
+                    stop_ev = STOP_EVENT
                     RUN_STATE.update(
                         {"running": True, "stop": False, "done": 0, "total": int(body.get("count", 1)), "ok": 0, "err": 0, "logs": []}
                     )
-                threading.Thread(target=_runner, args=(body,), daemon=True).start()
+                threading.Thread(target=_runner, args=(body, rid, stop_ev), daemon=True).start()
                 self._send_json({"ok": True})
             elif self.path == "/api/run/stop":
+                STOP_EVENT.set()
                 with RUN_LOCK:
                     RUN_STATE["stop"] = True
+                    if RUN_STATE["running"]:
+                        RUN_STATE["running"] = False
+                        RUN_STATE["logs"].append(f"[{_now_vn().strftime('%H:%M:%S')}] Đã dừng theo yêu cầu.")
                 self._send_json({"ok": True})
             else:
                 self._send_json({"error": "Not found"}, 404)

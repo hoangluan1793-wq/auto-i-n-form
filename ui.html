@@ -197,13 +197,14 @@
           <select id="delayMode" onchange="toggleCustomDelay()">
             <option value="instant">Điền ngay (~1-2 giây/phiếu)</option>
             <option value="short">Giãn cách ngắn (1 - 5 phút)</option>
-            <option value="standard">Giãn cách tiêu chuẩn (1 - 10 phút)</option>
-            <option value="long">Giãn cách dài (1 - 20 phút)</option>
-            <option value="custom">Tùy chỉnh (giây)</option>
+            <option value="standard">Giãn cách tiêu chuẩn (3 - 10 phút)</option>
+            <option value="long">Giãn cách dài (10 - 20 phút)</option>
+            <option value="custom_sec">Tùy chỉnh (giây)</option>
+            <option value="custom_min">Tùy chỉnh (phút)</option>
           </select>
         </div>
         <div id="customDelayBox" class="hidden">
-          <label class="lbl">Khoảng nghỉ (Min - Max giây)</label>
+          <label class="lbl" id="customDelayLbl">Khoảng nghỉ (Min - Max giây)</label>
           <div class="row">
             <input type="number" id="minSec" value="2" min="0" style="width:90px">
             <span>đến</span>
@@ -275,7 +276,18 @@ function switchMode(mode, btn){
 }
 
 function toggleCustomDelay(){
-  document.getElementById('customDelayBox').classList.toggle('hidden', document.getElementById('delayMode').value!=='custom');
+  const m = document.getElementById('delayMode').value;
+  const isCustom = m==='custom_sec' || m==='custom_min';
+  document.getElementById('customDelayBox').classList.toggle('hidden', !isCustom);
+  if(m==='custom_min'){
+    document.getElementById('customDelayLbl').textContent='Khoảng nghỉ (Min - Max phút)';
+    document.getElementById('minSec').value='20';
+    document.getElementById('maxSec').value='20';
+  }else if(m==='custom_sec'){
+    document.getElementById('customDelayLbl').textContent='Khoảng nghỉ (Min - Max giây)';
+    document.getElementById('minSec').value='2';
+    document.getElementById('maxSec').value='5';
+  }
 }
 
 async function init(){
@@ -540,7 +552,13 @@ async function startRun(){
   }catch(e){ alert(e.message); }
 }
 
-async function stopRun(){ await api('/api/run/stop',{}); }
+async function stopRun(){
+  const btn = document.getElementById('btnStop');
+  btn.disabled = true;
+  try{ await api('/api/run/stop',{}); }catch(_){}
+  btn.disabled = false;
+  pollStatus();
+}
 
 async function pollStatus(){
   if(pollTimer) clearTimeout(pollTimer);
