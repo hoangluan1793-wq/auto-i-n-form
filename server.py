@@ -78,6 +78,9 @@ def _in_schedule(start_s: str, end_s: str) -> bool:
 
 
 def _pick_delay(cfg: dict) -> float:
+    fixed_min = float(cfg.get("fixed_min") or 0)
+    if fixed_min > 0:
+        return fixed_min * 60.0
     mode = cfg.get("delay_mode", "instant")
     if mode == "instant":
         return random.uniform(1.0, 2.0)
